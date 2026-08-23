@@ -5,27 +5,39 @@
 
 #include "aux_protocol.h"
 
-// ---- motor speeds ----
+// ---- motor speeds (0..100) ----
 #define SPEED_BASE 30
 #define SPEED_MAIN 30
-#define SPEED_AUX  30
-#define SPEED_CLAW 30
+#define SPEED_AUX  15
+#define SPEED_CLAW 80
 
-// homing is done against physical end stops - keep it slow
-#define SPEED_HOMING 15
+// homing is done against physical end stops
+#define BASE_HOMING_SPEED 30
+#define MAIN_HOMING_SPEED 20
+#define AUX_HOMING_SPEED 15
+#define CLAW_HOMING_SPEED 80
 
-#define HOMING_TIMEOUT 30000   // ms, whole homing sequence
-#define MOTOR_TIMEOUT  15000   // ms, single motor move
-#define AUX_TIMEOUT    10000   // ms, aux unit move
+// angle correction values when changing movement direction
+#define BASE_CORRECTION_DEG 100
+#define MAIN_CORRECTION_DEG 100
+#define AUX_CORRECTION_DEG -100
+#define CLAW_CORRECTION_DEG 300
+
+#define HOMING_TIMEOUT   30000    // ms, whole homing sequence
+#define MOTOR_TIMEOUT    15000    // ms, single motor move
+#define AUX_UNIT_TIMEOUT 10000    // ms, aux unit move
+
+// ms to wait for the shield to report that a move actually started
+#define MOTOR_START_TIMEOUT 300
 
 // ---- WiFi link to the Raspberry Pi ----
-// The Pi runs the access point; the ESP32 is a client
+// Pi runs the access point, ESP is its client
 #define PI_SSID     "rearm"
 #define PI_PASSWORD "rearm1234"
-#define PI_HOST     "192.168.4.1"
+#define PI_HOST     "10.42.0.1"
 #define PI_PORT     8000
-#define WIFI_TIMEOUT 20000     // ms to join the AP
-#define HTTP_TIMEOUT 8000      // ms per request
+#define WIFI_TIMEOUT 60000 // ms to join the AP
+#define HTTP_TIMEOUT 8000  // ms per request
 
 namespace rearm {
 
@@ -44,14 +56,20 @@ typedef enum {
 } Touch;
 
 /**
- * Object as reported by the vision unit, already converted to millimetres
- * in the working-area frame (x: 0..ZONE_W, y: 0..ZONE_H).
+ * Which bank and which port a given motor lives on.
+ */
+struct MotorRef {
+    EVShieldBank *bank;
+    SH_Motor id;
+};
+
+/**
+ * Object reported by the vision unit.
  */
 struct ObjectData {
     int x;      // center, mm
     int y;      // center, mm
-    int w;      // long side, mm
-    int h;      // short side, mm
+    int w;      // short side to grip on, mm
     int r;      // orientation, degrees 0..179
     bool valid;
 };
@@ -64,12 +82,12 @@ extern EVs_NXTTouch touchClaw;
 extern EVs_NXTTouch touchAux;
 
 // Directions used during homing.
-const SH_Direction HOMING_DIR_BASE = SH_Direction_Forward;
-const SH_Direction HOMING_DIR_MAIN = SH_Direction_Forward;
-const SH_Direction HOMING_DIR_CLAW = SH_Direction_Reverse;
-const SH_Direction HOMING_DIR_AUX  = SH_Direction_Reverse;
+const SH_Direction BASE_HOMING_DIR = SH_Direction_Forward;
+const SH_Direction MAIN_HOMING_DIR = SH_Direction_Forward;
+const SH_Direction AUX_HOMING_DIR  = SH_Direction_Reverse;
+const SH_Direction CLAW_HOMING_DIR = SH_Direction_Reverse;
 
-// ---------------------------------------------------------------- setup
+// ---- setup ----
 
 /**
  * @brief Initializes the EVShield and the touch sensors.
@@ -81,7 +99,32 @@ void shieldInit();
  */
 void touchInit(Touch sensor);
 
-// ------------------------------------------------------------- aux unit
+// ---- motor metadata ----
+
+/**
+ * @brief Returns the bank and port for the given motor.
+ */
+MotorRef motorRef(Motor motor);
+
+/**
+ * @brief Returns +1 or -1, converting between joint space and raw motor space.
+ *
+ * Positive joint angles move AWAY from the home switch so the driving
+ * direction is the opposite of that motor's homing direction.
+ */
+int motorSign(Motor motor);
+
+/**
+ * @brief Returns the configured speed for the given motor (0..100).
+ */
+int motorSpeed(Motor motor);
+
+/**
+ * @brief Returns a short human-readable name, for log messages.
+ */
+const char *motorName(Motor motor);
+
+// ---- aux unit ----
 
 /**
  * @brief Checks whether the aux ESP32 answers on the I2C bus.
@@ -135,7 +178,7 @@ bool auxUnitSetZero();
  */
 bool auxUnitHome();
 
-// ---------------------------------------------------------- vision unit
+// ---- vision unit ----
 
 /**
  * @brief Joins the Pi's access point.
@@ -150,18 +193,31 @@ bool visionUnitCheck();
 /**
  * @brief Requests one object from the Pi.
  *
- * The Pi only reports an object once it has confirmed the object is not
- * moving, so a result with valid == false usually just means "not settled
- * yet" and the caller should retry rather than abort.
+ * valid == false means either "object is not settled" or "no object detected", retry rather than abort
  */
 ObjectData visionUnitRequestData();
 
-// --------------------------------------------------------------- motors
+// ---- motors ----
 
 /**
  * @brief Stops the given motor.
  */
 void motorStop(Motor motor, SH_Next_Action action);
+
+/**
+ * @brief Reads the shield status byte for the given motor.
+ *
+ * Useful bits: SH_STATUS_TACHO (encoder move in progress),
+ * SH_STATUS_STALL, SH_STATUS_MOVING, SH_STATUS_OVERLOAD.
+ */
+uint8_t motorStatus(Motor motor);
+
+/**
+ * @brief Reads the encoder position (in joint space).
+ *
+ * Positive means away from the home switch.
+ */
+long motorPosition(Motor motor);
 
 /**
  * @brief Starts a relative move; does not wait for completion.
@@ -175,6 +231,7 @@ bool motorStartMoveTo(Motor motor, int degrees);
 
 /**
  * @brief Blocks until the given motor finishes, or the timeout expires.
+ * @return false on stall or timeout.
  */
 bool motorWait(Motor motor, unsigned long timeout);
 
@@ -194,12 +251,7 @@ bool motorMoveBy(Motor motor, int degrees);
 bool motorMoveTo(Motor motor, int degrees);
 
 /**
- * @brief Reads the current encoder position of the given motor.
- */
-long motorPosition(Motor motor);
-
-/**
- * @brief Resets the internal position to 0.
+ * @brief Resets the encoder to 0 at the current position.
  */
 void motorResetEncoder(Motor motor);
 
@@ -218,14 +270,15 @@ bool homeAllMotors();
 /**
  * @brief Moves the arm to a pose. Blocks until every joint has arrived.
  *
- * @param x,y,z  Target position in mm (z = 0 is the sheet surface).
- * @param a      Claw rotation in degrees, or -1 to leave it where it is.
- * @param w      Claw opening in mm, or -1 to leave it where it is.
+ * The grip is controlled separately via auxUnit...()
+ *
+ * @param x,y,z Target position in mm (z = 0 is the sheet surface).
+ * @param a     Claw rotation in degrees, or -1 to leave it where it is.
  */
-bool moveToPose(int x, int y, int z, int a, int w);
+bool moveToPose(int x, int y, int z, int a);
 
 /**
- * @brief Move without touching claw rotation or grip.
+ * @brief Move without touching claw rotation.
  */
 bool moveToPosition(int x_mm, int y_mm, int z_mm);
 

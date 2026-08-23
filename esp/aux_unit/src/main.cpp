@@ -36,6 +36,8 @@
 
 #define GRAB_SPEED 30
 #define GRAB_TIMEOUT 8000   // ms for a single move
+#define GRAB_TOLERANCE 5    // motor degrees considered "arrived"
+#define GRAB_STALL_MS 400   // no movement for this long = stalled/arrived
 
 EVShield shield;
 
@@ -51,6 +53,9 @@ volatile int16_t  position = 0;     // cached, so onRequest never touches I2C
 
 bool moving = false;
 unsigned long moveStarted = 0;
+int16_t moveTarget = 0;
+int16_t lastPosition = 0;
+unsigned long lastMovement = 0;
 
 /**
  * Interrupt context. Latches the frame and returns immediately.
@@ -80,8 +85,18 @@ void onLinkReceive(int count) {
     }
 }
 
+void refreshLinkBuffer() {
+    uint8_t st = status;
+    uint8_t hi = (uint8_t)(position >> 8);
+    uint8_t lo = (uint8_t)(position & 0xFF);
+
+    uint8_t buf[AUX_MSG_LEN] = {st, hi, lo, auxChecksum(st, hi, lo)};
+    Wire1.slaveWrite(buf, AUX_MSG_LEN);
+}
+
 /**
  * Interrupt context. Serves cached values only.
+ * Kept as a fallback for cores where slaveWrite() is not used.
  */
 void onLinkRequest() {
     uint8_t st = status;
@@ -102,6 +117,8 @@ void startMoveBy(int delta) {
 
     SH_Direction dir = (delta > 0) ? SH_Direction_Forward : SH_Direction_Reverse;
 
+    moveTarget = (int16_t)(position + delta);
+
     GRAB_BANK.motorRunDegrees(
         GRAB_MOTOR,
         dir,
@@ -112,6 +129,8 @@ void startMoveBy(int delta) {
 
     moving = true;
     moveStarted = millis();
+    lastPosition = position;
+    lastMovement = moveStarted;
     status = AUX_ST_BUSY;
 }
 
@@ -190,6 +209,7 @@ void setup() {
     Wire1.onRequest(onLinkRequest);
 
     status = AUX_ST_UNHOMED;
+    refreshLinkBuffer();
 
     Serial.print("listening on 0x");
     Serial.println(AUX_I2C_ADDR, HEX);
@@ -221,23 +241,47 @@ void loop() {
             status = AUX_ST_IDLE;
 
         handleCommand(cmd, payload);
+
+        refreshLinkBuffer();
     }
 
     // --- track an in-flight move ---
     if (moving) {
         position = (int16_t)GRAB_BANK.motorGetEncoderPosition(GRAB_MOTOR);
 
-        if (GRAB_BANK.motorIsTachoDone(GRAB_MOTOR)) {
+        unsigned long now = millis();
+
+        if (abs((int)position - (int)lastPosition) > 2) {
+            lastPosition = position;
+            lastMovement = now;
+        }
+
+        bool arrived = abs((int)position - (int)moveTarget) <= GRAB_TOLERANCE;
+        bool stalled = (now - lastMovement) > GRAB_STALL_MS;
+
+        if (arrived || stalled) {
+            // a stall is normal here since the claw closing onto an object
+            // stops early and that counts as a successful grip.
+            GRAB_BANK.motorStop(GRAB_MOTOR, SH_Next_Action_BrakeHold);
             moving = false;
             status = AUX_ST_IDLE;
-            Serial.print("arrived at "); Serial.println(position);
-        } else if (millis() - moveStarted > GRAB_TIMEOUT) {
+
+            Serial.print(arrived ? "arrived at " : "stalled at ");
+            Serial.print(position);
+            Serial.print(" (target ");
+            Serial.print(moveTarget);
+            Serial.println(")");
+
+        } else if (now - moveStarted > GRAB_TIMEOUT) {
             GRAB_BANK.motorStop(GRAB_MOTOR, SH_Next_Action_Brake);
             moving = false;
             status = AUX_ST_ERROR;
             Serial.println("move timed out");
         }
     }
+
+    // Keep the staged reply current so any incoming read is served instantly.
+    refreshLinkBuffer();
 
     delay(5);
 }

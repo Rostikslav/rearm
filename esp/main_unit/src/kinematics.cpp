@@ -1,53 +1,64 @@
 #include "kinematics.h"
 #include <math.h>
 
-// NOTE: arduino core already defines it and the
-// redefinition either warns or silently shadows it. Use our own name.
+// The Arduino core already defines PI, so use our own name.
 #define KIN_PI 3.14159265358979323846
 
 namespace {
 
 const double EPS = 1e-9;
 
+inline int max(int a, int b) {
+    return a > b ? a : b;
+}
+
 inline double to_deg(double rad) {
     return rad * 180.0 / KIN_PI;
 }
 
-/**
- * acos / asin that return NaN instead of undefined behaviour when the
- * argument leaves [-1, 1]. A small tolerance absorbs floating point error
- * on poses that are geometrically exactly at the limit.
- */
+// acos / asin returning NaN instead of undefined behavior outside [-1, 1].
+// The tolerance absorbs float error on poses exactly at the limit.
 double safe_acos(double v) {
-    if (v > 1.0) {
-        if (v <= 1.0 + 1e-9) v = 1.0;
-        else return NAN;
-    }
-    if (v < -1.0) {
-        if (v >= -1.0 - 1e-9) v = -1.0;
-        else return NAN;
-    }
+    if (v > 1.0)  return (v <= 1.0 + 1e-9) ? 0.0 : NAN;
+    if (v < -1.0) return (v >= -1.0 - 1e-9) ? KIN_PI : NAN;
     return acos(v);
 }
 
 double safe_asin(double v) {
-    if (v > 1.0) {
-        if (v <= 1.0 + 1e-9) v = 1.0;
-        else return NAN;
-    }
-    if (v < -1.0) {
-        if (v >= -1.0 - 1e-9) v = -1.0;
-        else return NAN;
-    }
+    if (v > 1.0)  return (v <= 1.0 + 1e-9) ? KIN_PI / 2 : NAN;
+    if (v < -1.0) return (v >= -1.0 - 1e-9) ? -KIN_PI / 2 : NAN;
     return asin(v);
 }
 
+// x-distance to the object
 inline double dist_x(double x) {
     return x - ZONE_W / 2.0;
 }
 
+// y-distance to the object
 inline double dist_y(double y) {
     return ZONE_H + ZONE_GAP - y;
+}
+
+// euclidean distance to the object
+double dist_obj(double x, double y) {
+    double dx = dist_x(x);
+    double dy = dist_y(y);
+
+    return sqrt(dx * dx + dy * dy);
+}
+
+// claw tip height relative to the shoulder joint
+inline double vertical_offset(double z) {
+    return z + CLAW_HEIGHT - BASE_ELEVATION;
+}
+
+// straight-line distance from the shoulder joint to the wrist
+double shoulder_to_wrist(double x, double y, double z) {
+    double planar = dist_obj(x, y) - CLAW_EXTENSION;
+    double vertical = vertical_offset(z);
+
+    return sqrt(planar * planar + vertical * vertical);
 }
 
 double base_rotation(double x, double y) {
@@ -58,30 +69,6 @@ double base_rotation(double x, double y) {
         return NAN;
 
     return 90.0 + to_deg(atan(dx / dy));
-}
-
-double dist_obj(double x, double y) {
-    double dx = dist_x(x);
-    double dy = dist_y(y);
-
-    return sqrt(dx * dx + dy * dy);
-}
-
-/**
- * Vertical offset of the claw tip relative to the shoulder joint.
- */
-inline double vertical_offset(double z) {
-    return z + CLAW_HEIGHT - BASE_ELEVATION;
-}
-
-/**
- * Straight-line distance from the shoulder joint to the wrist.
- */
-double shoulder_to_wrist(double x, double y, double z) {
-    double planar = dist_obj(x, y) - CLAW_EXTENSION;
-    double vertical = vertical_offset(z);
-
-    return sqrt(planar * planar + vertical * vertical);
 }
 
 double main_arm_rotation(double x, double y, double z) {
@@ -96,7 +83,7 @@ double main_arm_rotation(double x, double y, double z) {
 
     double angle2 = safe_asin(vertical_offset(z) / diagonal);
 
-    return 90.0 - to_deg(angle1 + angle2) - MAIN_ARM_ROT;
+    return 90.0 - to_deg(angle1 + angle2) - MAIN_ARM_INIT;
 }
 
 double aux_arm_rotation(double x, double y, double z) {
@@ -109,50 +96,38 @@ double aux_arm_rotation(double x, double y, double z) {
     return 180.0 - to_deg(angle);
 }
 
-double claw_grab_rotation(double w) {
-    double angle = safe_asin(((w - CLAW_BASE_DIST) / 2.0) / CLAW_LENGTH);
-
-    return 90.0 - (CLAW_ROT_INIT + to_deg(angle));
-}
-
-/**
- * Normalizes an angle into [0, 180).
- */
+// normalizes into [0, 180) with small error tolerance
 int normalize_claw_angle(int a) {
     int r = a % 180;
-    if (r < 0) r += 180;
+    if (r < -5) r += 180;
+    else if (r < 0) r = 0;
     return r;
 }
 
-bool isValid(int x, int y, int z, int a, int w) {
-    // TODO
-    return true;
+// the claw angle is relative to the arm, so the base rotation has to come out
+double claw_rotation(double a, double base) {
+    return normalize_claw_angle((int)(a + base - 90));
 }
 
 } // namespace
 
-MotorAngles calculate_motor_angles(int x, int y, int z, int a, int w) {
-    MotorAngles angles = {0, 0, 0, 0, 0, false};
-
-    if (!isValid(x, y, z, a, w))
-        return angles;
+MotorAngles calculate_motor_angles(int x, int y, int z, int a) {
+    MotorAngles angles = {0, 0, 0, 0, false};
 
     double base = base_rotation(x, y);
     double main = main_arm_rotation(x, y, z);
     double aux  = aux_arm_rotation(x, y, z);
-    double grab = claw_grab_rotation(w);
+    double claw = claw_rotation(a, base);
 
-    // Hard safety net. Casting a NaN or an infinity to int is undefined
-    // behavior - in practice it produces an arbitrary value, which would
-    // command the joints to a random position at full travel.
-    if (!isfinite(base) || !isfinite(main) || !isfinite(aux) || !isfinite(grab))
+    // casting NaN or infinity to int is undefined behavior and in practice
+    // yields an arbitrary value that would send a joint to full travel
+    if (!isfinite(base) || !isfinite(main) || !isfinite(aux) || !isfinite(claw))
         return angles;
 
-    angles.base = (int)(base * BASE_ROT_RATIO);
-    angles.main = (int)(main * MAIN_ARM_RATIO);
-    angles.aux  = (int)(aux  * AUX_ARM_RATIO);
-    angles.claw = (int)(normalize_claw_angle(a) * CLAW_ROT_RATIO);
-    angles.grab = (int)(grab * CLAW_GRAB_RATIO);
+    angles.base = max(0, (int)(base * BASE_ROT_RATIO));
+    angles.main = max(0, (int)(main * MAIN_ROT_RATIO));
+    angles.aux  = max(0, (int)(aux  * AUX_ROT_RATIO));
+    angles.claw = max(0, (int)(claw * CLAW_ROT_RATIO));
     angles.valid = true;
 
     return angles;

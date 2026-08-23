@@ -16,19 +16,7 @@ EVs_NXTTouch touchMain;
 EVs_NXTTouch touchClaw;
 EVs_NXTTouch touchAux;
 
-namespace {
-
-/**
- * The aux ESP32 hangs off the SAME on-board I2C bus as the EVShield banks.
- * Addresses don't collide (0x09 vs 0x34 / 0x36), so a single Wire instance
- * serves both. The old code created a second software bus on GPIO 16/17
- * that was never wired up.
- */
-
-struct MotorRef {
-    EVShieldBank *bank;
-    SH_Motor id;
-};
+// ---- motor metadata
 
 MotorRef motorRef(Motor motor) {
     switch (motor) {
@@ -38,6 +26,20 @@ MotorRef motorRef(Motor motor) {
     case MOTOR_CLAW: return {&shield.bank_b, SH_Motor_1};
     }
     return {&shield.bank_a, SH_Motor_1};
+}
+
+int motorSign(Motor motor) {
+    SH_Direction homingDir;
+
+    switch (motor) {
+    case MOTOR_BASE: homingDir = BASE_HOMING_DIR; break;
+    case MOTOR_MAIN: homingDir = MAIN_HOMING_DIR; break;
+    case MOTOR_AUX:  homingDir = AUX_HOMING_DIR;  break;
+    case MOTOR_CLAW: homingDir = CLAW_HOMING_DIR; break;
+    default:         homingDir = SH_Direction_Forward; break;
+    }
+
+    return (homingDir == SH_Direction_Forward) ? -1 : 1;
 }
 
 int motorSpeed(Motor motor) {
@@ -59,6 +61,33 @@ const char *motorName(Motor motor) {
     }
     return "?";
 }
+
+int motorCorrection(Motor motor) {
+    switch (motor) {
+    case MOTOR_BASE: return BASE_CORRECTION_DEG;
+    case MOTOR_MAIN: return MAIN_CORRECTION_DEG;
+    case MOTOR_AUX:  return AUX_CORRECTION_DEG;
+    case MOTOR_CLAW: return CLAW_CORRECTION_DEG;
+    }
+    return 0;
+}
+
+namespace {
+
+// direction of the last move for each joint: +1, -1, or 0 for "empty"
+int lastDirection[4] = {0, 0, 0, 0};
+
+// total compensation currently baked into each motor encoder
+long backlashOffset[4] = {0, 0, 0, 0};
+
+} // namespace
+
+void motorResetBacklash(Motor motor) {
+    lastDirection[motor] = 0;
+    backlashOffset[motor] = 0;
+}
+
+namespace {
 
 /**
  * Minimal JSON field readers. The Pi sends a flat object with known keys,
@@ -98,7 +127,7 @@ int jsonInt(const String &src, const char *key, int fallback) {
 
 } // namespace
 
-// ---------------------------------------------------------------- setup
+// ---- setup
 
 void touchInit(Touch sensor) {
     switch (sensor) {
@@ -118,7 +147,7 @@ void shieldInit() {
     touchInit(TOUCH_CLAW);
 }
 
-// ------------------------------------------------------------- aux unit
+// ---- aux unit
 
 bool auxUnitCheck() {
     Wire.beginTransmission(AUX_I2C_ADDR);
@@ -148,33 +177,37 @@ bool auxUnitSend(uint8_t cmd, int16_t payload) {
 }
 
 uint8_t auxUnitStatus(int16_t *position) {
-    uint8_t received = Wire.requestFrom(AUX_I2C_ADDR, AUX_MSG_LEN);
-    if (received != AUX_MSG_LEN) {
-        // drain anything partial so the next read starts clean
-        while (Wire.available()) Wire.read();
-        return AUX_ST_ERROR;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0)
+            delay(10);
+
+        uint8_t received = Wire.requestFrom(AUX_I2C_ADDR, AUX_MSG_LEN);
+        if (received != AUX_MSG_LEN) {
+            while (Wire.available()) Wire.read();
+            continue;
+        }
+
+        uint8_t status = Wire.read();
+        uint8_t hi = Wire.read();
+        uint8_t lo = Wire.read();
+        uint8_t sum = Wire.read();
+
+        if (sum != auxChecksum(status, hi, lo))
+            continue;
+
+        if (position)
+            *position = (int16_t)(((uint16_t)hi << 8) | lo);
+
+        return status;
     }
 
-    uint8_t status = Wire.read();
-    uint8_t hi = Wire.read();
-    uint8_t lo = Wire.read();
-    uint8_t sum = Wire.read();
-
-    if (sum != auxChecksum(status, hi, lo))
-        return AUX_ST_ERROR;
-
-    if (position)
-        *position = (int16_t)(((uint16_t)hi << 8) | lo);
-
-    return status;
+    return AUX_ST_ERROR;
 }
 
 bool auxUnitWaitIdle(unsigned long timeout) {
     unsigned long start = millis();
 
-    // Give the slave a moment to latch the command and report BUSY, so we
-    // don't read a stale IDLE from before the command landed.
-    delay(100);
+    delay(30);
 
     while (millis() - start < timeout) {
         uint8_t status = auxUnitStatus(nullptr);
@@ -192,7 +225,7 @@ bool auxUnitWaitIdle(unsigned long timeout) {
             return false;
         }
 
-        delay(50);
+        delay(20);
     }
 
     Serial.println("ERROR: aux unit timed out.");
@@ -204,7 +237,7 @@ bool auxUnitMoveTo(int deg) {
         Serial.println("ERROR: aux MOVE_TO not acknowledged.");
         return false;
     }
-    return auxUnitWaitIdle(AUX_TIMEOUT);
+    return auxUnitWaitIdle(AUX_UNIT_TIMEOUT);
 }
 
 bool auxUnitMoveBy(int deg) {
@@ -212,7 +245,7 @@ bool auxUnitMoveBy(int deg) {
         Serial.println("ERROR: aux MOVE_BY not acknowledged.");
         return false;
     }
-    return auxUnitWaitIdle(AUX_TIMEOUT);
+    return auxUnitWaitIdle(AUX_UNIT_TIMEOUT);
 }
 
 bool auxUnitSetZero() {
@@ -220,7 +253,7 @@ bool auxUnitSetZero() {
         Serial.println("ERROR: aux SET_ZERO not acknowledged.");
         return false;
     }
-    return auxUnitWaitIdle(AUX_TIMEOUT);
+    return auxUnitWaitIdle(AUX_UNIT_TIMEOUT);
 }
 
 bool auxUnitHome() {
@@ -228,22 +261,32 @@ bool auxUnitHome() {
         Serial.println("ERROR: aux HOME not acknowledged.");
         return false;
     }
-    return auxUnitWaitIdle(AUX_TIMEOUT);
+    return auxUnitWaitIdle(AUX_UNIT_TIMEOUT);
 }
 
-// ---------------------------------------------------------- vision unit
+// ---- vision unit
 
 bool visionUnitConnect() {
     if (WiFi.status() == WL_CONNECTED)
         return true;
+    
+    #if 0 // only for debugging in case of connection failure
+        int n = WiFi.scanNetworks();
+        Serial.printf("%d networks found:\n", n);
+        for (int i = 0; i < n; i++) {
+            Serial.printf("  %-24s ch%-3d %4d dBm  enc=%d\n",
+                WiFi.SSID(i).c_str(), WiFi.channel(i), WiFi.RSSI(i), WiFi.encryptionType(i));
+        }
+    #endif
 
     WiFi.mode(WIFI_STA);
     WiFi.begin(PI_SSID, PI_PASSWORD);
 
+    Serial.print("Connecting to the Pi access point");
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED) {
         if (millis() - start > WIFI_TIMEOUT) {
-            Serial.println("ERROR: could not join the Pi access point.");
+            Serial.println("\nERROR: could not join the Pi access point.");
             return false;
         }
         delay(250);
@@ -298,43 +341,48 @@ bool visionUnitCheck() {
 }
 
 ObjectData visionUnitRequestData() {
-    ObjectData data = {0, 0, 0, 0, 0, false};
+    ObjectData data = {0, 0, 0, 0, false};
 
     String body = visionGet("/object");
     if (body.length() == 0)
         return data;
 
-    if (!jsonBool(body, "valid", false)) {
-        // NOT an error: the Pi reports invalid while the scene is still
-        // moving, or when the sheet is empty.
+    // NOT an error: the Pi reports invalid while the scene is still moving or when the sheet is empty.
+    if (!jsonBool(body, "valid", false))
         return data;
-    }
 
     data.x = jsonInt(body, "x", 0);
     data.y = jsonInt(body, "y", 0);
     data.w = jsonInt(body, "w", 0);
-    data.h = jsonInt(body, "h", 0);
     data.r = jsonInt(body, "r", 0);
     data.valid = true;
 
     return data;
 }
 
-// --------------------------------------------------------------- motors
+// ---- motors
 
 void motorStop(Motor motor, SH_Next_Action action) {
     MotorRef ref = motorRef(motor);
     ref.bank->motorStop(ref.id, action);
 }
 
+uint8_t motorStatus(Motor motor) {
+    MotorRef ref = motorRef(motor);
+    return ref.bank->motorGetStatusByte(ref.id);
+}
+
 long motorPosition(Motor motor) {
     MotorRef ref = motorRef(motor);
-    return ref.bank->motorGetEncoderPosition(ref.id);
+    // converted to joint space (positive means away from the home switch)
+    long raw = (long)ref.bank->motorGetEncoderPosition(ref.id) * motorSign(motor);
+    return raw - backlashOffset[motor];
 }
 
 void motorResetEncoder(Motor motor) {
     MotorRef ref = motorRef(motor);
     ref.bank->motorResetEncoder(ref.id);
+    motorResetBacklash(motor);
 }
 
 bool motorStartMoveBy(Motor motor, int degrees) {
@@ -342,15 +390,33 @@ bool motorStartMoveBy(Motor motor, int degrees) {
         return true;
 
     MotorRef ref = motorRef(motor);
-    SH_Direction dir = (degrees > 0) ? SH_Direction_Forward : SH_Direction_Reverse;
 
-    return ref.bank->motorRunDegrees(
+    int direction = (degrees > 0) ? 1 : -1;
+
+    // Reversing direction or moving for the first time after homing
+    // means the gear train has slack to take up before the joint responds.
+    // Drive the extra degrees and remember them so that motorPosition() stays
+    // honest about where the joint actually is
+    if (direction != lastDirection[motor]) {
+        long correction = (long)motorCorrection(motor) * direction;
+        degrees += correction;
+        backlashOffset[motor] += correction;
+    }
+    lastDirection[motor] = direction;
+
+    // convert the joint-space delta into a raw motor direction
+    long raw = (long)degrees * motorSign(motor);
+    SH_Direction dir = (raw > 0) ? SH_Direction_Forward : SH_Direction_Reverse;
+
+    ref.bank->motorRunDegrees(
         ref.id,
         dir,
         motorSpeed(motor),
-        (long)abs(degrees),
+        labs(raw),
         SH_Completion_Dont_Wait,
         SH_Next_Action_BrakeHold);
+
+    return true;
 }
 
 bool motorStartMoveTo(Motor motor, int degrees) {
@@ -359,20 +425,39 @@ bool motorStartMoveTo(Motor motor, int degrees) {
 }
 
 bool motorWait(Motor motor, unsigned long timeout) {
-    MotorRef ref = motorRef(motor);
     unsigned long start = millis();
+    bool started = false;
 
-    while (!ref.bank->motorIsTachoDone(ref.id)) {
-        if (millis() - start > timeout) {
-            motorStop(motor, SH_Next_Action_Brake);
-            Serial.print("ERROR: timeout waiting for motor ");
-            Serial.println(motorName(motor));
-            return false;
+    // Wait for TACHO to appear first, otherwise we would read
+    // the pre-command status and conclude the move was already finished.
+    while (millis() - start < MOTOR_START_TIMEOUT) {
+        if (motorStatus(motor) & SH_STATUS_TACHO) {
+            started = true;
+            break;
         }
         delay(10);
     }
 
-    return true;
+    if (!started) {
+        // either the move was too short to observe or the shield never took
+        // the command. anyways treat it as done rather than hanging
+        return true;
+    }
+
+    // wait for TACHO to clear
+    while (millis() - start < timeout) {
+        if ((motorStatus(motor) & SH_STATUS_TACHO) == 0)
+            return true;    // move complete
+
+        delay(10);
+    }
+
+    motorStop(motor, SH_Next_Action_Brake);
+    Serial.print("ERROR: timeout waiting for motor ");
+    Serial.print(motorName(motor));
+    Serial.print(" at ");
+    Serial.println(motorPosition(motor));
+    return false;
 }
 
 bool motorWaitAll(unsigned long timeout) {
@@ -413,21 +498,23 @@ bool homeAllMotors() {
     // --- stage 1: main and aux, so the arm folds up before it swings ---
 
     if (!mainHomed)
-        shield.bank_a.motorRunUnlimited(SH_Motor_2, HOMING_DIR_MAIN, SPEED_HOMING);
+        shield.bank_a.motorRunUnlimited(SH_Motor_2, MAIN_HOMING_DIR, MAIN_HOMING_SPEED);
 
     if (!auxHomed)
-        shield.bank_b.motorRunUnlimited(SH_Motor_2, HOMING_DIR_AUX, SPEED_HOMING);
+        shield.bank_b.motorRunUnlimited(SH_Motor_2, AUX_HOMING_DIR, AUX_HOMING_SPEED);
 
     startTime = millis();
     while (!(mainHomed && auxHomed)) {
         if (!mainHomed && touchMain.isPressed()) {
             motorStop(MOTOR_MAIN, SH_Next_Action_Brake);
+            delay(100);
             motorResetEncoder(MOTOR_MAIN);
             mainHomed = true;
         }
 
         if (!auxHomed && touchAux.isPressed()) {
             motorStop(MOTOR_AUX, SH_Next_Action_Brake);
+            delay(100);
             motorResetEncoder(MOTOR_AUX);
             auxHomed = true;
         }
@@ -444,21 +531,23 @@ bool homeAllMotors() {
     // --- stage 2: base and claw rotation ---
 
     if (!baseHomed)
-        shield.bank_a.motorRunUnlimited(SH_Motor_1, HOMING_DIR_BASE, SPEED_HOMING);
+        shield.bank_a.motorRunUnlimited(SH_Motor_1, BASE_HOMING_DIR, BASE_HOMING_SPEED);
 
     if (!clawHomed)
-        shield.bank_b.motorRunUnlimited(SH_Motor_1, HOMING_DIR_CLAW, SPEED_HOMING);
+        shield.bank_b.motorRunUnlimited(SH_Motor_1, CLAW_HOMING_DIR, CLAW_HOMING_SPEED);
 
     startTime = millis();
     while (!(baseHomed && clawHomed)) {
         if (!baseHomed && touchBase.isPressed()) {
             motorStop(MOTOR_BASE, SH_Next_Action_Brake);
+            delay(100);
             motorResetEncoder(MOTOR_BASE);
             baseHomed = true;
         }
 
         if (!clawHomed && touchClaw.isPressed()) {
             motorStop(MOTOR_CLAW, SH_Next_Action_Brake);
+            delay(100);
             motorResetEncoder(MOTOR_CLAW);
             clawHomed = true;
         }
@@ -476,23 +565,22 @@ bool homeAllMotors() {
     return true;
 }
 
-// ----------------------------------------------------------- high level
+// ---- high level
 
-bool moveToPose(int x, int y, int z, int a, int w) {
-    // The claw opening only affects the aux unit, but calculate_motor_angles
-    // needs a numerically valid width, so substitute a harmless one when the
-    // caller doesn't want the grip touched.
-    int width = (w < 0) ? (int)CLAW_BASE_DIST : w;
-    int angle = (a < 0) ? 0 : a;
-
-    MotorAngles target = calculate_motor_angles(x, y, z, angle, width);
+bool moveToPose(int x, int y, int z, int a) {
+    MotorAngles target = calculate_motor_angles(x, y, z, (a < 0) ? 0 : a);
 
     if (!target.valid) {
-        Serial.print("ERROR: unreachable pose x=");
-        Serial.print(x); Serial.print(" y="); Serial.print(y);
-        Serial.print(" z="); Serial.println(z);
+        Serial.printf("ERROR: unreachable pose (x=%d, y=%d, z=%d)\n", x, y, z);
         return false;
     }
+
+    Serial.printf("Moving to (x=%d, y=%d, z=%d): base=%d, main=%d, aux=%d, claw=%d\n",
+        x, y, z,
+        (int)(target.base / BASE_ROT_RATIO),
+        (int)(target.main / MAIN_ROT_RATIO),
+        (int)(target.aux / AUX_ROT_RATIO),
+        (int)(target.claw / CLAW_ROT_RATIO));
 
     // Start the joints together, then wait for all of them. Running them in
     // parallel roughly halves the cycle time versus one move at a time.
@@ -517,18 +605,11 @@ bool moveToPose(int x, int y, int z, int a, int w) {
     if (a >= 0)
         ok &= motorWait(MOTOR_CLAW, MOTOR_TIMEOUT);
 
-    if (!ok)
-        return false;
-
-    // The grip is on the other ESP32, so it moves after the arm is in place.
-    if (w >= 0 && !auxUnitMoveTo(target.grab))
-        return false;
-
-    return true;
+    return ok;
 }
 
 bool moveToPosition(int x_mm, int y_mm, int z_mm) {
-    return moveToPose(x_mm, y_mm, z_mm, -1, -1);
+    return moveToPose(x_mm, y_mm, z_mm, -1);
 }
 
 } // namespace rearm

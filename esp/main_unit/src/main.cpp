@@ -1,54 +1,51 @@
 #include <Arduino.h>
 #include <EVShield.h>
 #include <Wire.h>
+#include <HTTPClient.h>
 
 #include "rearm.h"
 #include "kinematics.h"
 
 // ---- vertical waypoints, mm above the sheet ----
-#define Z_APPROACH 60   // hover here before descending onto the object
-#define Z_GRIP      0   // claw tips at the sheet surface
-#define Z_LIFT     60   // carry height while the object is held
+#define Z_HOVER 30
+#define Z_GRIP  20
 
-// ---- grip tuning, mm ----
-#define GRIP_CLEARANCE 12   // how much wider than the object the claw opens
-#define GRIP_SQUEEZE    3   // how far past the object width the claw closes
+// ---- drop-off pose ----
+#define DROP_X 200
+#define DROP_Y 65
+#define DROP_ANGLE 90
 
-#define CLAW_ANGLE_OFFSET 90
+// grab motor travel from fully open to gripping (in motor degrees).
+// Fixed rather than computed from the object width because
+// LEGO flex makes a width-derived opening unreliable
+#define GRAB_CLOSE_DEG 1600
 
 #define RETRY_DELAY 1500   // ms between vision polls
 
 namespace {
 
-int gripWidth(const rearm::ObjectData &obj) {
-    return min(obj.w, obj.h);
-}
 
-int gripAngle(const rearm::ObjectData &obj) {
-    int a = (obj.r + CLAW_ANGLE_OFFSET) % 180;
-    if (a < 0) a += 180;
-    return a;
-}
-
-/**
- * The grab motor has no limit switch, so its zero has to be established by
- * hand at startup. 
- */
-bool establishGripZero() {
-    Serial.println();
-    Serial.println("=== CLAW SETUP ===");
-    Serial.println("Open the claw FULLY by hand, then send 'ok' to continue.");
-
+// blocks until given string is typed in
+void waitForInput(String s){
+    Serial.printf("Type \"%s\" to continue\n", s);
     while (true) {
         if (Serial.available() > 0) {
             String line = Serial.readStringUntil('\n');
-            line.trim();
-            if (line.equalsIgnoreCase("ok"))
+            if (line.equalsIgnoreCase(s))
                 break;
-            Serial.println("Send 'ok' once the claw is fully open.");
         }
         delay(50);
     }
+}
+
+/**
+ * the grab motor has no limit switch so its zero is established by hand
+ */
+bool establishGripZero() {
+    Serial.println("\n=== CLAW SETUP ===");
+    Serial.println("Open the claw FULLY by hand, then send 'ok' to continue.");
+
+    waitForInput("ok");
 
     if (!rearm::auxUnitSetZero()) {
         Serial.println("ERROR: could not set the grip zero.");
@@ -60,66 +57,40 @@ bool establishGripZero() {
 }
 
 bool pickAndCenter(const rearm::ObjectData &obj) {
-    int width = gripWidth(obj);
-    int angle = gripAngle(obj);
+    Serial.printf("\n--- pickup: x=%d y=%d w=%d r=%d ---\n",
+                  obj.x, obj.y, obj.w, obj.r);
 
-    Serial.println();
-    Serial.println("--- pickup sequence ---");
-    Serial.print("object x="); Serial.print(obj.x);
-    Serial.print(" y=");       Serial.print(obj.y);
-    Serial.print(" w=");       Serial.print(obj.w);
-    Serial.print(" h=");       Serial.print(obj.h);
-    Serial.print(" r=");       Serial.println(obj.r);
-    Serial.print("grip width="); Serial.print(width);
-    Serial.print(" angle=");     Serial.println(angle);
+    Serial.println("[1/8] hover");
+    if (!rearm::moveToPose(obj.x, obj.y, Z_HOVER, obj.r)) return false;
+    delay(500);
 
-    // 1. hover above the object, claw rotated and opened wide
-    Serial.println("[1/8] approach");
-    if (!rearm::moveToPose(obj.x, obj.y, Z_APPROACH, angle, width + GRIP_CLEARANCE))
-        return false;
+    Serial.println("[2/8] lower");
+    if (!rearm::moveToPose(obj.x, obj.y, Z_GRIP, -1)) return false;
+    delay(500);
 
-    // 2. descend onto it
-    Serial.println("[2/8] descend");
-    if (!rearm::moveToPose(obj.x, obj.y, Z_GRIP, angle, -1))
-        return false;
+    Serial.println("[3/8] grab");
+    if (!rearm::auxUnitMoveTo(GRAB_CLOSE_DEG)) return false;
+    delay(500);
 
-    // 3. close the claw
-    Serial.println("[3/8] grip");
-    if (!rearm::moveToPose(obj.x, obj.y, Z_GRIP, angle, width - GRIP_SQUEEZE))
-        return false;
-
-    // 4. lift
     Serial.println("[4/8] lift");
-    if (!rearm::moveToPose(obj.x, obj.y, Z_LIFT, angle, -1))
-        return false;
+    if (!rearm::moveToPose(obj.x, obj.y, Z_HOVER, -1)) return false;
+    delay(500);
 
-    // 5. swing to the centre of the sheet, still holding
-    Serial.println("[5/8] traverse to centre");
-    if (!rearm::moveToPose(ZONE_CENTER_X, ZONE_CENTER_Y, Z_LIFT, angle, -1))
-        return false;
+    Serial.println("[5/8] traverse");
+    if (!rearm::moveToPose(DROP_X, DROP_Y, Z_HOVER, DROP_ANGLE)) return false;
+    delay(500);
 
-    // 6. lower
     Serial.println("[6/8] lower");
-    if (!rearm::moveToPose(ZONE_CENTER_X, ZONE_CENTER_Y, Z_GRIP, angle, -1))
-        return false;
+    if (!rearm::moveToPose(DROP_X, DROP_Y, Z_GRIP, -1)) return false;
+   delay(500);
 
-    // 7. release
     Serial.println("[7/8] release");
-    if (!rearm::moveToPose(ZONE_CENTER_X, ZONE_CENTER_Y, Z_GRIP, angle,
-                           width + GRIP_CLEARANCE))
-        return false;
+    if (!rearm::auxUnitMoveTo(0)) return false;
+    delay(500);
 
-    // 8. retreat and go home, clearing the camera's view
-    Serial.println("[8/8] retreat");
-    if (!rearm::moveToPose(ZONE_CENTER_X, ZONE_CENTER_Y, Z_LIFT, angle, -1))
-        return false;
-
-    if (!rearm::homeAllMotors())
-        return false;
-
-    if (!rearm::auxUnitHome())
-        return false;
-
+    Serial.println("[8/8] home");
+    if (!rearm::homeAllMotors() || !rearm::auxUnitSetZero()) return false;
+    
     Serial.println("--- sequence complete ---");
     return true;
 }
@@ -128,12 +99,14 @@ bool pickAndCenter(const rearm::ObjectData &obj) {
 
 void setup() {
     Serial.begin(115200);
+    Wire.begin();
     delay(1000);
 
-    Serial.println();
-    Serial.println("=== rearm starting ===");
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(100);
 
-    Wire.begin();
+    Serial.println("\n=== rearm starting ===");
     rearm::shieldInit();
 
     Serial.println("Waiting for the aux unit...");
@@ -165,21 +138,23 @@ void setup() {
         while (1) delay(1000);
     }
 
-    Serial.println();
-    Serial.println("Ready. Place an object on the sheet.");
+    Serial.println("\nReady. Place an object on the sheet.");
 }
 
 void loop() {
+    Serial.println("Requesting object data...");
     rearm::ObjectData obj = rearm::visionUnitRequestData();
 
     if (!obj.valid) {
-        // Either nothing on the sheet, or the scene is still moving and the
-        // Pi is holding back the result. Both cases just mean "wait".
-        Serial.printf("No valid object detected, trying again in %f seconds", RETRY_DELAY/1000.0f);
         delay(RETRY_DELAY);
         return;
     }
 
+    if (!rearm::auxUnitSetZero()) {
+        Serial.println("Aux unit decided to go on vacation mid sequence.");
+        Serial.println("Halting execution. Check connection and reset the arm.");
+        while(1) delay(1000);
+    }
     if (!pickAndCenter(obj)) {
         Serial.println("Sequence aborted. Re-homing before the next attempt.");
         rearm::stopAllMotors(SH_Next_Action_Brake);
@@ -187,6 +162,5 @@ void loop() {
         rearm::homeAllMotors();
     }
 
-    // Let the operator move the object again before the next cycle.
-    delay(3000);
+    waitForInput(" "); // press space to re-run the sequence
 }
