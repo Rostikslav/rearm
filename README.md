@@ -569,7 +569,6 @@ A normal operating cycle can be summarized as follows:
 ``` text
 ├───esp
 │   ├───aux_unit
-│   │   ├───.vscode
 │   │   ├───lib
 │   │   │   └───EVShield-master/     - EVShield library
 │   │   └───src
